@@ -34,6 +34,11 @@ import {
   MAX_RANGES_PER_CLIENT,
   MAX_CLIENT_ID_LENGTH,
 } from './shared-fetch.js';
+import {
+  planCacheEdits,
+  MAX_CACHED_INTERVALS as MAX_EDIT_CACHED_INTERVALS,
+  MAX_EDITS,
+} from './cache-edit.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -231,6 +236,36 @@ const sharedFetchBodySchema = {
   },
 };
 
+const editSchema = {
+  type: 'object',
+  required: ['start', 'deleteBytes', 'insertBytes'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    deleteBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    insertBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const cacheEditBodySchema = {
+  type: 'object',
+  required: ['size', 'cached', 'edits'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    cached: {
+      type: 'array',
+      maxItems: MAX_EDIT_CACHED_INTERVALS,
+      items: cacheIntervalSchema,
+    },
+    edits: {
+      type: 'array',
+      maxItems: MAX_EDITS,
+      items: editSchema,
+    },
+  },
+};
+
 // Resume planning demands strict types: Fastify's default ajv setup coerces
 // scalar types and silently strips unknown properties, which would let a
 // string like "1000" pass as a byte count. This route therefore validates
@@ -423,6 +458,27 @@ export function buildApp(config = {}) {
         clients: request.body.clients,
         maxFetchBytes: request.body.maxFetchBytes,
         maxGapBytes: request.body.maxGapBytes,
+      });
+
+      return reply.status(result.statusCode).send(result);
+    },
+  );
+
+  // Sparse-cache reuse after resource edits: POST /cache-edit-plan with the
+  // old resource size, the old cached intervals and the edits (all in old
+  // coordinates); returns the new size, reusable old->new interval mappings
+  // and the new resource's fetch gaps. No Range header involved.
+  app.post(
+    '/cache-edit-plan',
+    {
+      schema: { body: cacheEditBodySchema },
+      validatorCompiler: strictBodyValidatorCompiler,
+    },
+    async (request, reply) => {
+      const result = planCacheEdits({
+        size: request.body.size,
+        cached: request.body.cached,
+        edits: request.body.edits,
       });
 
       return reply.status(result.statusCode).send(result);

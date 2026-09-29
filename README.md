@@ -36,6 +36,12 @@ API，遵循 [RFC 9110 §14](https://www.rfc-editor.org/rfc/rfc9110.html#section
 闭区间与可直接使用的 `Range` 值、每个客户端被各次回源覆盖的字节，以及
 去重需求 / 实际回源 / 额外获取的字节核算（见下文）。
 
+`POST /cache-edit-plan` 面向**编辑后稀疏缓存复用**：资源经插入/删除后，
+上报旧资源大小、旧缓存闭区间与编辑列表（均为旧坐标，可乱序），服务按
+区间算出新资源大小、可复用的旧/新闭区间映射（编辑处分裂、删除不复用、
+插入即缺口，仅旧/新两侧均相邻的映射才合并），以及新资源升序归并后的
+缺口区间（见下文）。
+
 ## 单条启动命令
 
 ```bash
@@ -682,6 +688,98 @@ curl -X POST http://localhost:3000/shared-fetch-plan \
 独立回源 `[0,99]` 与 `[105,199]`，`extraBytes: 0`；相邻需求（间隙为 0，
 如 `[0,99]` 与 `[100,199]`）在第 1 步归并阶段即合并，不产生额外字节。
 
+### `POST /cache-edit-plan`（编辑后稀疏缓存复用规划）
+
+资源经过插入/删除编辑后，旧稀疏缓存中**未被改动的字节仍然可复用**，只是
+偏移发生了平移。本接口输入**旧资源大小** `size`、旧缓存闭区间 `cached`
+和编辑列表 `edits`（坐标全部相对**旧资源**），返回新资源大小、旧/新闭区间
+复用映射以及新资源缺口。每个编辑先从 `start` 起删除 `deleteBytes` 字节，
+再在同处插入 `insertBytes` 字节；编辑区间外的字节保持不变，允许在资源尾部
+插入（`start === size`）。全部参数在 JSON 体内，不涉及 `Range` 请求头。
+
+请求体：
+
+| 字段       | 类型    | 必填 | 说明                                                         |
+| ---------- | ------- | ---- | ------------------------------------------------------------ |
+| `size`     | integer | 是   | **旧**资源总字节数，非负安全整数（≥ 0）；为 0 时 `cached` 必须为空 |
+| `cached`   | array   | 是   | 旧缓存区间数组（≤ 1000 项），每项 `{"start":…,"end":…}` 为**闭区间**，须满足 `0 ≤ start ≤ end < size`；可乱序、重叠 |
+| `edits`    | array   | 是   | 编辑数组（≤ 1000 项），每项 `{"start":…,"deleteBytes":…,"insertBytes":…}`，三者均为非负安全整数；可乱序，服务按 `start` 升序处理 |
+
+编辑的语义与约束：
+
+- `start + deleteBytes ≤ size`：删除可覆盖到最后一个字节；`deleteBytes: 0`
+  为纯插入，`start` 可取到 `size`（尾部插入）。
+- 两个编辑的 `start` 不得相同；按起点排序后，后一编辑的 `start` 不得落入
+  前一编辑的删除范围（即 `start < 前.start + 前.deleteBytes`）；首尾相接
+  （后一编辑紧接前一删除范围之后）允许。
+- `deleteBytes` 与 `insertBytes` 同时为 0 的双零编辑报 `400`。
+- 编辑后新资源大小 = `size + Σ(insertBytes − deleteBytes)`，超过
+  `Number.MAX_SAFE_INTEGER` 时报 `400`（`NEW_SIZE_OVERFLOW`）。
+
+计算规则（全部按区间运算，不逐字节展开，求和经 BigInt 避免精度溢出）：
+
+1. **缓存去重归并**：重叠的旧缓存区间先合并（重叠字节只计一次）；仅相邻、
+   不重叠的输入保持独立，由后续映射合并规则决定边界是否存活。
+2. **编辑处分裂**：每个缓存区间在编辑边界处分裂，删除字节一律**不复用**，
+   插入字节在新资源中全部是**缺口**；存活字节按其之前所有编辑的净位移
+   （`insert − delete` 之和）平移到新坐标。
+3. **映射合并**：相邻两段映射只有在**旧、新坐标同时相邻**时才合并——插入
+   会在新坐标侧制造缺口，删除会破坏旧坐标侧的相邻，二者都会阻止合并。
+4. **缺口归并**：新资源 `[0, newSize − 1]` 减去映射新区间的补集，按起点
+   升序、自动归并为闭区间。
+
+响应（`200`）字段：
+
+| 字段          | 说明                                                         |
+| ------------- | ------------------------------------------------------------ |
+| `oldSize`     | 旧资源字节数（即请求的 `size`）                               |
+| `newSize`     | 编辑后的新资源字节数                                          |
+| `mappings`    | 可复用映射数组，每项 `{"oldStart","oldEnd","newStart","newEnd"}` 均为闭区间，升序、互不相交 |
+| `reusedBytes` | 可复用字节数（各映射长度之和）                                |
+| `gaps`        | 新资源缺口闭区间数组（需回源获取的字节，含全部插入字节），升序归并 |
+| `gapBytes`    | 缺口字节数；恒有 `reusedBytes + gapBytes === newSize`         |
+
+示例：旧资源 100 字节，缓存 `[0,9]` 与 `[20,29]`；在旧坐标 10 处删除
+`[10,19]` 共 10 字节并插入 5 字节——新资源 95 字节；`[0,9]` 不动，
+`[20,29]` 整体前移到 `[15,24]`；插入的 5 字节 `[10,14]` 与其他未缓存
+字节构成缺口：
+
+```bash
+curl -X POST http://localhost:3000/cache-edit-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"size":100,"cached":[{"start":0,"end":9},{"start":20,"end":29}],"edits":[{"start":10,"deleteBytes":10,"insertBytes":5}]}'
+```
+
+响应：
+
+```json
+{
+  "statusCode": 200,
+  "oldSize": 100,
+  "newSize": 95,
+  "mappings": [
+    { "oldStart": 0, "oldEnd": 9, "newStart": 0, "newEnd": 9 },
+    { "oldStart": 20, "oldEnd": 29, "newStart": 15, "newEnd": 24 }
+  ],
+  "reusedBytes": 20,
+  "gaps": [
+    { "start": 10, "end": 14 },
+    { "start": 25, "end": 94 }
+  ],
+  "gapBytes": 75
+}
+```
+
+纯插入会把同一段缓存在映射中分裂（旧坐标相邻、新坐标被插入字节隔开，故
+不合并）；例如 100 字节全量缓存、在旧坐标 50 处插入 10 字节时，
+`mappings` 为 `[0,49]→[0,49]` 与 `[50,99]→[60,109]`，`gaps` 为
+`[50,59]`。空资源（`size: 0`）只能配空缓存与 `start: 0` 的尾部插入。
+错误码包括：`INVALID_SIZE`、`INVALID_CACHED`、`TOO_MANY_CACHED`、
+`INVALID_CACHED_RANGE`、`CACHED_RANGE_OUT_OF_BOUNDS`、`INVALID_EDITS`、
+`TOO_MANY_EDITS`、`INVALID_EDIT`、`EDIT_OUT_OF_BOUNDS`、
+`EDIT_RANGE_OUT_OF_BOUNDS`、`EMPTY_EDIT`、`DUPLICATE_EDIT_START`、
+`EDITS_OVERLAP`、`NEW_SIZE_OVERFLOW`。
+
 服务默认监听本机 **3000 端口**（`http://localhost:3000`），用
 `docker compose up --build -d` 一条命令即可启动（见上文"单条启动命令"）。
 
@@ -810,7 +908,8 @@ src/
   cache-integrity.js # 稀疏缓存完整性校验：片段合并、逐块 SHA-256 比对、verified/missing/corrupt 分类、重取区间合并
   cache-retention.js # 缓存保留规划：缓存归并、访问权重扫描线累加、按权重/偏移选满预算、截断与归并
   shared-fetch.js   # 共享回源规划：多客户端需求全局归并去重、按上限拆块、带空隙阈值的自左向右合并、逐客户端覆盖核算
-  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、/healthz、输入校验
+  cache-edit.js     # 编辑后缓存复用规划：编辑校验与排序、缓存去重、编辑边界分裂、净位移映射、旧/新双相邻合并、缺口补集（BigInt 求和）
+  app.js            # Fastify 应用：POST/GET /plan、POST /resume-plan、POST /multipart-check、POST /assemble-response、POST /cache-integrity-check、POST /cache-retention-plan、POST /shared-fetch-plan、POST /cache-edit-plan、/healthz、输入校验
   server.js         # 启动入口与环境变量读取
 test/
   planner.test.js       # 原有 node:test 用例（26 个）
@@ -822,6 +921,7 @@ test/
   cache-integrity.test.js # 稀疏缓存完整性校验用例（30 个）
   cache-retention.test.js # 缓存保留规划用例（29 个）
   shared-fetch.test.js  # 共享回源规划用例（34 个）
+  cache-edit.test.js    # 编辑后缓存复用规划用例（33 个）
 ```
 
 ## 本地开发与测试
