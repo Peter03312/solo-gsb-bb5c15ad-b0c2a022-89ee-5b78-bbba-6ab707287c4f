@@ -34,6 +34,11 @@ import {
   MAX_RANGES_PER_CLIENT,
   MAX_CLIENT_ID_LENGTH,
 } from './shared-fetch.js';
+import {
+  planCacheEdit,
+  MAX_CACHED_INTERVALS as MAX_EDIT_CACHED_INTERVALS,
+  MAX_EDITS,
+} from './cache-edit.js';
 import { ENTITY_TAG_RE, parseHttpDate } from './conditional.js';
 
 const MEDIA_TYPE_RE =
@@ -228,6 +233,46 @@ const sharedFetchBodySchema = {
     },
     maxFetchBytes: { type: 'integer', minimum: 1, maximum: Number.MAX_SAFE_INTEGER },
     maxGapBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const editCachedIntervalSchema = {
+  type: 'object',
+  required: ['start', 'end'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    end: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const resourceEditSchema = {
+  type: 'object',
+  required: ['start', 'deleteBytes', 'insertBytes'],
+  additionalProperties: false,
+  properties: {
+    start: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    deleteBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    insertBytes: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+  },
+};
+
+const cacheEditBodySchema = {
+  type: 'object',
+  required: ['size', 'cached', 'edits'],
+  additionalProperties: false,
+  properties: {
+    size: { type: 'integer', minimum: 0, maximum: Number.MAX_SAFE_INTEGER },
+    cached: {
+      type: 'array',
+      maxItems: MAX_EDIT_CACHED_INTERVALS,
+      items: editCachedIntervalSchema,
+    },
+    edits: {
+      type: 'array',
+      maxItems: MAX_EDITS,
+      items: resourceEditSchema,
+    },
   },
 };
 
@@ -428,6 +473,29 @@ export function buildApp(config = {}) {
       return reply.status(result.statusCode).send(result);
     },
   );
+
+  const cacheEditHandler = async (request, reply) => {
+    const result = planCacheEdit({
+      size: request.body.size,
+      cached: request.body.cached,
+      edits: request.body.edits,
+    });
+
+    return reply.status(result.statusCode).send(result);
+  };
+
+  // Sparse cache remapping after insertion/deletion edits. All edits are in
+  // old-resource coordinates; no Range header is involved.
+  for (const route of ['/cache-edit-plan', '/sparse-cache-edit-plan']) {
+    app.post(
+      route,
+      {
+        schema: { body: cacheEditBodySchema },
+        validatorCompiler: strictBodyValidatorCompiler,
+      },
+      cacheEditHandler,
+    );
+  }
 
   // Convenience endpoint so the API is probeable with a bare curl:
   //   curl 'http://localhost:3000/plan?size=1000' -H 'Range: bytes=0-99'
